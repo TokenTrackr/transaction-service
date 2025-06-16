@@ -1,12 +1,11 @@
 package com.tokentrackr.transaction_service.saga;
-
 import com.tokentrackr.transaction_service.dto.events.*;
 import com.tokentrackr.transaction_service.entity.Transaction;
 import com.tokentrackr.transaction_service.enums.TransactionStatus;
+import com.tokentrackr.transaction_service.enums.TransactionType;
+import com.tokentrackr.transaction_service.exception.TransactionNotFoundException;
 import com.tokentrackr.transaction_service.repository.TransactionRepository;
 import com.tokentrackr.transaction_service.service.messaging.EventPublisher;
-
-
 
 import java.util.concurrent.ConcurrentHashMap;
 
@@ -27,6 +26,7 @@ public class TransactionSagaOrchestratorImpl implements TransactionSagaOrchestra
 
         TransactionSagaState sagaState = TransactionSagaState.builder()
                 .sagaId(transaction.getSagaId())
+                .transactionType(transaction.getTransactionType())
                 .balanceUpdated(false)
                 .assetUpdated(false)
                 .completed(false)
@@ -34,16 +34,12 @@ public class TransactionSagaOrchestratorImpl implements TransactionSagaOrchestra
 
         sagaStates.put(transaction.getSagaId(), sagaState);
 
-        // Start with balance update
-        BalanceUpdateEvent balanceEvent = BalanceUpdateEvent.builder()
-                .sagaId(transaction.getSagaId())
-                .transactionId(transaction.getId())
-                .userId(transaction.getUserId())
-                .amount(transaction.getTotalSpent())
-                .transactionType(transaction.getTransactionType())
-                .build();
-
-        eventPublisher.publishBalanceUpdate(balanceEvent);
+        // Start with appropriate step based on transaction type
+        if (transaction.getTransactionType() == TransactionType.BUY) {
+            publishBalanceUpdate(transaction, TransactionType.BUY);
+        } else {
+            publishAssetUpdate(transaction, TransactionType.SELL);
+        }
     }
 
     public void handleBalanceUpdated(BalanceUpdatedEvent event) {
@@ -55,25 +51,18 @@ public class TransactionSagaOrchestratorImpl implements TransactionSagaOrchestra
             return;
         }
 
-        if (event.isSuccess()) {
-            sagaState.setBalanceUpdated(true);
+        sagaState.setBalanceUpdated(true);
 
-            // Proceed to asset update
-            Transaction transaction = transactionRepository.findBySagaId(event.getSagaId())
-                    .orElseThrow(() -> new RuntimeException("Transaction not found for sagaId: " + event.getSagaId()));
+        Transaction transaction = transactionRepository.findBySagaId(event.getSagaId())
+                .orElseThrow(() -> new RuntimeException("Transaction not found for sagaId: " + event.getSagaId()));
 
-            AssetUpdateEvent assetEvent = AssetUpdateEvent.builder()
-                    .sagaId(event.getSagaId())
-                    .transactionId(event.getTransactionId())
-                    .userId(event.getUserId())
-                    .cryptoId(transaction.getCryptoId())
-                    .quantity(transaction.getQuantity())
-                    .transactionType(transaction.getTransactionType())
-                    .build();
-
-            eventPublisher.publishAssetUpdate(assetEvent);
+        // Determine next step based on transaction type
+        if (sagaState.getTransactionType() == TransactionType.BUY) {
+            // After balance update for BUY, update assets
+            publishAssetUpdate(transaction, TransactionType.BUY);
         } else {
-            handleSagaFailure(event.getSagaId(), event.getTransactionId(), event.getFailureReason());
+            // For SELL, balance update is the final step
+            handleSagaCompletion(event.getSagaId(), event.getTransactionId());
         }
     }
 
@@ -86,25 +75,78 @@ public class TransactionSagaOrchestratorImpl implements TransactionSagaOrchestra
             return;
         }
 
-        if (event.isSuccess()) {
-            sagaState.setAssetUpdated(true);
+        sagaState.setAssetUpdated(true);
+
+        Transaction transaction = transactionRepository.findBySagaId(event.getSagaId())
+                .orElseThrow(() -> new RuntimeException("Transaction not found for sagaId: " + event.getSagaId()));
+
+        // Determine next step based on transaction type
+        if (sagaState.getTransactionType() == TransactionType.BUY) {
+            // For BUY, asset update is the final step
             handleSagaCompletion(event.getSagaId(), event.getTransactionId());
         } else {
-            // Need to compensate balance update
-            compensateBalanceUpdate(event.getSagaId(), event.getTransactionId());
-            handleSagaFailure(event.getSagaId(), event.getTransactionId(), event.getFailureReason());
+            // After asset update for SELL, update balance
+            publishBalanceUpdate(transaction, TransactionType.SELL);
         }
     }
 
     public void handleBalanceUpdateFailed(BalanceUpdateFailedEvent event) {
         log.info("Handling balance update failed event for saga: {}", event.getSagaId());
+
+        TransactionSagaState sagaState = sagaStates.get(event.getSagaId());
+        if (sagaState == null) {
+            log.error("SAGA state not found for sagaId: {}", event.getSagaId());
+            return;
+        }
+
+        // Only compensate if we've already updated assets (SELL transaction)
+        if (sagaState.getTransactionType() == TransactionType.SELL && sagaState.isAssetUpdated()) {
+            compensateAssetUpdate(event.getSagaId(), event.getTransactionId());
+        }
+
         handleSagaFailure(event.getSagaId(), event.getTransactionId(), event.getFailureReason());
     }
 
     public void handleAssetUpdateFailed(AssetUpdateFailedEvent event) {
         log.info("Handling asset update failed event for saga: {}", event.getSagaId());
-        compensateBalanceUpdate(event.getSagaId(), event.getTransactionId());
+
+        TransactionSagaState sagaState = sagaStates.get(event.getSagaId());
+        if (sagaState == null) {
+            log.error("SAGA state not found for sagaId: {}", event.getSagaId());
+            return;
+        }
+
+        // Only compensate if we've already updated balance (BUY transaction)
+        if (sagaState.getTransactionType() == TransactionType.BUY && sagaState.isBalanceUpdated()) {
+            compensateBalanceUpdate(event.getSagaId(), event.getTransactionId());
+        }
+
         handleSagaFailure(event.getSagaId(), event.getTransactionId(), event.getFailureReason());
+    }
+
+    private void publishBalanceUpdate(Transaction transaction, TransactionType type) {
+        BalanceUpdateEvent balanceEvent = BalanceUpdateEvent.builder()
+                .sagaId(transaction.getSagaId())
+                .transactionId(transaction.getId())
+                .userId(transaction.getUserId())
+                .amount(transaction.getTotalSpent())
+                .transactionType(type)
+                .build();
+
+        eventPublisher.publishBalanceUpdate(balanceEvent);
+    }
+
+    private void publishAssetUpdate(Transaction transaction, TransactionType type) {
+        AssetUpdateEvent assetEvent = AssetUpdateEvent.builder()
+                .sagaId(transaction.getSagaId())
+                .transactionId(transaction.getId())
+                .userId(transaction.getUserId())
+                .cryptoId(transaction.getCryptoId())
+                .quantity(transaction.getQuantity())
+                .transactionType(type)
+                .build();
+
+        eventPublisher.publishAssetUpdate(assetEvent);
     }
 
     private void handleSagaCompletion(String sagaId, java.util.UUID transactionId) {
@@ -155,18 +197,44 @@ public class TransactionSagaOrchestratorImpl implements TransactionSagaOrchestra
         log.info("Compensating balance update for transaction: {}", transactionId);
 
         Transaction transaction = transactionRepository.findById(transactionId)
-                .orElseThrow(() -> new RuntimeException("Transaction not found: " + transactionId));
+                .orElseThrow(() -> new TransactionNotFoundException("Transaction not found: " + transactionId));
 
         // Reverse the balance update
+        TransactionType reverseType = transaction.getTransactionType() == TransactionType.BUY ?
+                TransactionType.SELL : TransactionType.BUY;
+
         BalanceUpdateEvent compensationEvent = BalanceUpdateEvent.builder()
                 .sagaId(sagaId)
                 .transactionId(transactionId)
                 .userId(transaction.getUserId())
                 .amount(transaction.getTotalSpent())
-                .transactionType(transaction.getTransactionType() == com.tokentrackr.transaction_service.enums.TransactionType.BUY ?
-                        com.tokentrackr.transaction_service.enums.TransactionType.SELL : com.tokentrackr.transaction_service.enums.TransactionType.BUY)
+                .transactionType(reverseType)
+                .isCompensation(true)  // Add this field to your event if needed
                 .build();
 
         eventPublisher.publishBalanceUpdate(compensationEvent);
+    }
+
+    private void compensateAssetUpdate(String sagaId, java.util.UUID transactionId) {
+        log.info("Compensating asset update for transaction: {}", transactionId);
+
+        Transaction transaction = transactionRepository.findById(transactionId)
+                .orElseThrow(() -> new TransactionNotFoundException("Transaction not found: " + transactionId));
+
+        // Reverse the asset update
+        TransactionType reverseType = transaction.getTransactionType() == TransactionType.BUY ?
+                TransactionType.SELL : TransactionType.BUY;
+
+        AssetUpdateEvent compensationEvent = AssetUpdateEvent.builder()
+                .sagaId(sagaId)
+                .transactionId(transactionId)
+                .userId(transaction.getUserId())
+                .cryptoId(transaction.getCryptoId())
+                .quantity(transaction.getQuantity())
+                .transactionType(reverseType)
+                .isCompensation(true)  // Add this field to your event if needed
+                .build();
+
+        eventPublisher.publishAssetUpdate(compensationEvent);
     }
 }

@@ -13,6 +13,7 @@ public class BalanceUpdateEvent {
     private UUID transactionId;
     private String userId;
     private BigDecimal amount;
+    private Boolean isCompensation;
     private TransactionType transactionType;
 }
 

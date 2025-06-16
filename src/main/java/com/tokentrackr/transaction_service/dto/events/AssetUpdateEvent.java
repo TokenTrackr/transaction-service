@@ -14,5 +14,6 @@ public class AssetUpdateEvent {
     private String userId;
     private String cryptoId;
     private BigDecimal quantity;
+    private Boolean isCompensation;
     private TransactionType transactionType;
 }
