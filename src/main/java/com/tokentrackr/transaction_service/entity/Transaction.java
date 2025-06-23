@@ -65,4 +65,10 @@ public class Transaction {
 
     @Column(name = "failure_reason")
     private String failureReason;
+
+    @PrePersist
+    protected void onCreate() {
+        createdAt = LocalDateTime.now();
+        updatedAt = LocalDateTime.now();
+    }
 }
